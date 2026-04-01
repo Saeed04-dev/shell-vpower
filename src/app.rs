@@ -123,13 +123,30 @@ impl App {
                                 InputAction::Paste => {
                                     app.handle_paste()?;
                                 }
+                                InputAction::ScrollUp(n) => {
+                                    let idx = grid::rc_to_index(app.layout, app.focus.0, app.focus.1);
+                                    if idx < app.cells.len() {
+                                        app.cells[idx].scroll_up(n);
+                                    }
+                                    app.draw(terminal)?;
+                                }
+                                InputAction::ScrollDown(n) => {
+                                    let idx = grid::rc_to_index(app.layout, app.focus.0, app.focus.1);
+                                    if idx < app.cells.len() {
+                                        app.cells[idx].scroll_down(n);
+                                    }
+                                    app.draw(terminal)?;
+                                }
                                 InputAction::PtyInput(data) => {
-                                    // Any keyboard input clears selection
+                                    // Any keyboard input clears selection and resets scroll
+                                    let idx = grid::rc_to_index(app.layout, app.focus.0, app.focus.1);
                                     if app.selection.is_some() {
                                         app.selection = None;
-                                        app.draw(terminal)?;
                                     }
-                                    let idx = grid::rc_to_index(app.layout, app.focus.0, app.focus.1);
+                                    if idx < app.cells.len() {
+                                        app.cells[idx].reset_scroll();
+                                    }
+                                    app.draw(terminal)?;
                                     app.pty_manager.write_to(idx, &data)?;
                                 }
                                 InputAction::None => {}
@@ -151,6 +168,7 @@ impl App {
                 Some(output) = pty_rx.recv() => {
                     if output.cell_index < app.cells.len() {
                         app.cells[output.cell_index].feed(&output.data);
+                        app.cells[output.cell_index].reset_scroll();
                     }
                     app.draw(terminal)?;
                 }
@@ -291,6 +309,20 @@ impl App {
                 // Right-click to paste
                 self.handle_paste()?;
             }
+            MouseEventKind::ScrollUp => {
+                if let Some((cell_idx, _, _)) = self.screen_to_cell(x, y) {
+                    if cell_idx < self.cells.len() {
+                        self.cells[cell_idx].scroll_up(3);
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some((cell_idx, _, _)) = self.screen_to_cell(x, y) {
+                    if cell_idx < self.cells.len() {
+                        self.cells[cell_idx].scroll_down(3);
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -397,6 +429,9 @@ impl App {
         let cells = &self.cells;
         let focus = self.focus;
 
+        // Build scroll-back flags for each cell
+        let scrolled_back: Vec<bool> = self.cells.iter().map(|c| c.is_scrolled_back()).collect();
+
         // Build selection info for rendering
         let selection = self.selection.as_ref().map(|sel| Selection {
             cell_index: sel.cell_index,
@@ -413,6 +448,7 @@ impl App {
                 cells,
                 focus_index,
                 selection: selection.as_ref(),
+                scrolled_back: &scrolled_back,
             };
 
             frame.render_widget(grid_widget, area);
@@ -424,10 +460,12 @@ impl App {
                     width: area.width,
                     height: 1,
                 };
+                let focus_scrolled = scrolled_back.get(focus_index).copied().unwrap_or(false);
                 let status = StatusBar {
                     layout,
                     focus_row: focus.0,
                     focus_col: focus.1,
+                    focus_scrolled,
                 };
                 frame.render_widget(status, status_area);
             }

@@ -17,6 +17,10 @@ pub enum InputAction {
     Copy,
     /// Paste from clipboard.
     Paste,
+    /// Scroll the focused cell up by N lines.
+    ScrollUp(usize),
+    /// Scroll the focused cell down by N lines.
+    ScrollDown(usize),
     /// Send raw bytes to the focused PTY.
     PtyInput(Vec<u8>),
     /// No action (unrecognized key combo).
@@ -54,6 +58,15 @@ pub fn handle_key_event(event: KeyEvent) -> InputAction {
     // Ctrl+V → Paste
     if mods.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('v') {
         return InputAction::Paste;
+    }
+
+    // Shift+PageUp/PageDown → scroll focused cell
+    if mods.contains(KeyModifiers::SHIFT) {
+        match event.code {
+            KeyCode::PageUp => return InputAction::ScrollUp(10),
+            KeyCode::PageDown => return InputAction::ScrollDown(10),
+            _ => {}
+        }
     }
 
     // Alt combinations → multiplexer commands

@@ -84,7 +84,7 @@ impl PtyInstance {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break, // PTY closed
+                    Ok(0) => break,
                     Ok(n) => {
                         let data = buf[..n].to_vec();
                         if output_tx
@@ -94,7 +94,7 @@ impl PtyInstance {
                             })
                             .is_err()
                         {
-                            break; // Receiver dropped
+                            break;
                         }
                     }
                     Err(_) => break,

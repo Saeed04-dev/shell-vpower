@@ -34,8 +34,11 @@ pub struct StyledChar {
     pub ch: char,
     pub style: CellStyle,
 }
+
 impl Default for StyledChar {
-    fn default() -> Self { Self { ch: ' ', style: CellStyle::default() } }
+    fn default() -> Self {
+        Self { ch: ' ', style: CellStyle::default() }
+    }
 }
 
 fn blank_line(w: usize) -> Vec<StyledChar> {
@@ -67,6 +70,8 @@ pub struct TerminalCell {
     auto_wrap: bool,
     pub cursor_visible: bool,
     parser: Parser,
+    /// Scrollback offset: 0 = live (showing bottom), >0 = scrolled up N lines.
+    scroll_offset: usize,
 }
 
 impl TerminalCell {
@@ -92,6 +97,7 @@ impl TerminalCell {
             auto_wrap: true,
             cursor_visible: true,
             parser: Parser::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -147,12 +153,40 @@ impl TerminalCell {
     }
 
     pub fn visible_lines(&self) -> &[Vec<StyledChar>] {
-        let end = (self.screen_top + self.height).min(self.lines.len());
-        if self.screen_top < self.lines.len() {
-            &self.lines[self.screen_top..end]
+        // screen_top points to the live viewport top (bottom of scrollback).
+        // scroll_offset moves the view upward from that position.
+        let live_end = (self.screen_top + self.height).min(self.lines.len());
+        let start = live_end.saturating_sub(self.height + self.scroll_offset);
+        let end = start + self.height;
+        let end = end.min(self.lines.len());
+        if start < self.lines.len() {
+            &self.lines[start..end]
         } else {
             &[]
         }
+    }
+
+    /// Scroll the view up by `n` lines (toward older output).
+    pub fn scroll_up(&mut self, n: usize) {
+        // Maximum scroll offset: all lines above the current viewport
+        let live_end = (self.screen_top + self.height).min(self.lines.len());
+        let max_offset = live_end.saturating_sub(self.height);
+        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+    }
+
+    /// Scroll the view down by `n` lines (toward newer output).
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    /// Reset scroll to live mode (bottom of buffer).
+    pub fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Returns true if the view is scrolled back (not showing the live bottom).
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scroll_offset > 0
     }
 }
 

@@ -99,6 +99,8 @@ pub struct GridWidget<'a> {
     pub cells: &'a [TerminalCell],
     pub focus_index: usize,
     pub selection: Option<&'a Selection>,
+    /// Which cell indices are scrolled back (not showing live output).
+    pub scrolled_back: &'a [bool],
 }
 
 impl<'a> Widget for GridWidget<'a> {
@@ -108,8 +110,17 @@ impl<'a> Widget for GridWidget<'a> {
         for i in 0..visible_count {
             let rect = self.cell_rects[i];
             let is_focused = i == self.focus_index;
+            let is_scrolled = self.scrolled_back.get(i).copied().unwrap_or(false);
 
             draw_border(buf, rect, is_focused);
+
+            // Show scroll indicator in the top-right corner of the border
+            if is_scrolled && rect.width >= 4 && rect.height >= 2 {
+                let indicator_x = rect.x + rect.width - 3;
+                let indicator_y = rect.y;
+                let style = Style::default().fg(Color::Yellow);
+                set_cell(buf, indicator_x, indicator_y, '▲', style);
+            }
 
             if i < self.cells.len() {
                 let sel = self
@@ -213,6 +224,8 @@ pub struct StatusBar {
     pub layout: GridLayout,
     pub focus_row: usize,
     pub focus_col: usize,
+    /// Whether the focused cell is scrolled back.
+    pub focus_scrolled: bool,
 }
 
 impl Widget for StatusBar {
@@ -222,9 +235,10 @@ impl Widget for StatusBar {
             GridLayout::Grid3x3 => "3x3",
             GridLayout::Grid4x4 => "4x4",
         };
+        let scroll_indicator = if self.focus_scrolled { " [SCROLL] |" } else { "" };
         let text = format!(
-            " vpower-shell | Layout: {} | Focus: ({},{}) | Alt+G: cycle | Ctrl+Arrow: move | Ctrl+C/V: copy/paste | Ctrl+Q: quit ",
-            layout_name, self.focus_row, self.focus_col
+            " vpower-shell | Layout: {} | Focus: ({},{}) |{} Alt+G: cycle | Ctrl+Arrow: move | Shift+PgUp/Dn: scroll | Ctrl+Q: quit ",
+            layout_name, self.focus_row, self.focus_col, scroll_indicator
         );
 
         let style = Style::default().fg(Color::Black).bg(Color::Cyan);

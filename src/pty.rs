@@ -132,11 +132,29 @@ impl PtyInstance {
     }
 }
 
+/// Check if an executable exists on PATH.
+#[cfg(windows)]
+fn which_exists(name: &str) -> bool {
+    std::process::Command::new("where")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Get the default shell for the current platform.
 fn get_default_shell() -> String {
     #[cfg(windows)]
     {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        // Prefer PowerShell (supports cd across drives, modern syntax)
+        // Try pwsh (PowerShell 7+) first, then fall back to Windows PowerShell
+        if which_exists("pwsh.exe") {
+            "pwsh.exe".to_string()
+        } else {
+            "powershell.exe".to_string()
+        }
     }
     #[cfg(not(windows))]
     {

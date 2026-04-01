@@ -3,7 +3,7 @@
 //! Parses crossterm key events and dispatches them as either multiplexer
 //! commands (Alt+Arrow, Alt+G, Ctrl+Q) or raw input for the focused PTY.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Actions that the input handler can produce.
 pub enum InputAction {
@@ -13,6 +13,10 @@ pub enum InputAction {
     CycleLayout,
     /// Move focus in the given direction.
     MoveFocus(Direction),
+    /// Copy selected text (or send Ctrl+C if no selection).
+    Copy,
+    /// Paste from clipboard.
+    Paste,
     /// Send raw bytes to the focused PTY.
     PtyInput(Vec<u8>),
     /// No action (unrecognized key combo).
@@ -30,11 +34,26 @@ pub enum Direction {
 
 /// Process a crossterm key event and return the corresponding action.
 pub fn handle_key_event(event: KeyEvent) -> InputAction {
+    // Only handle key press events — ignore Release/Repeat to prevent double input on Windows
+    if event.kind != KeyEventKind::Press {
+        return InputAction::None;
+    }
+
     let mods = event.modifiers;
 
     // Ctrl+Q → Quit
     if mods.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('q') {
         return InputAction::Quit;
+    }
+
+    // Ctrl+C → Copy (app decides: copy selection or send interrupt)
+    if mods.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
+        return InputAction::Copy;
+    }
+
+    // Ctrl+V → Paste
+    if mods.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('v') {
+        return InputAction::Paste;
     }
 
     // Alt combinations → multiplexer commands
@@ -47,6 +66,17 @@ pub fn handle_key_event(event: KeyEvent) -> InputAction {
             KeyCode::Right => InputAction::MoveFocus(Direction::Right),
             _ => InputAction::None,
         };
+    }
+
+    // Ctrl+Arrow as fallback for focus movement (works on all terminals)
+    if mods.contains(KeyModifiers::CONTROL) {
+        match event.code {
+            KeyCode::Up => return InputAction::MoveFocus(Direction::Up),
+            KeyCode::Down => return InputAction::MoveFocus(Direction::Down),
+            KeyCode::Left => return InputAction::MoveFocus(Direction::Left),
+            KeyCode::Right => return InputAction::MoveFocus(Direction::Right),
+            _ => {}
+        }
     }
 
     // Everything else → convert to bytes for the PTY
@@ -66,11 +96,11 @@ fn key_to_bytes(event: KeyEvent) -> Vec<u8> {
         KeyCode::Char(c) => {
             if ctrl {
                 // Ctrl+A = 0x01, Ctrl+B = 0x02, etc.
-                let ctrl_byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
-                if ctrl_byte <= 26 {
+                let lower = c.to_ascii_lowercase();
+                if lower >= 'a' && lower <= 'z' {
+                    let ctrl_byte = (lower as u8) - b'a' + 1;
                     return vec![ctrl_byte];
                 }
-                // Ctrl+letter not in a-z — just send the char
                 let mut buf = [0u8; 4];
                 c.encode_utf8(&mut buf);
                 buf[..c.len_utf8()].to_vec()

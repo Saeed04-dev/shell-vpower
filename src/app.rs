@@ -7,10 +7,11 @@ use crate::grid::{self, CellRect, GridLayout};
 use crate::input::{self, Direction, InputAction};
 use crate::pty::{PtyManager, PtyOutput};
 use crate::terminal_cell::TerminalCell;
-use crate::ui::{GridWidget, StatusBar};
+use crate::ui::{GridWidget, Selection, StatusBar};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream};
+use arboard::Clipboard;
+use crossterm::event::{Event, EventStream, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -28,8 +29,19 @@ fn cell_inner_size(cell_rects: &[CellRect], index: usize) -> (u16, u16) {
             return (inner.width, inner.height);
         }
     }
-    // Fallback for very small cells
     (1, 1)
+}
+
+/// Mouse selection state.
+struct SelectionState {
+    /// Which cell the selection is in.
+    cell_index: usize,
+    /// Start position (row, col) within visible lines.
+    start: (usize, usize),
+    /// End position (row, col) within visible lines.
+    end: (usize, usize),
+    /// Whether the user is actively dragging.
+    dragging: bool,
 }
 
 /// Application state.
@@ -46,6 +58,10 @@ pub struct App {
     pty_manager: PtyManager,
     /// Terminal size (width, height) excluding the status bar.
     term_size: (u16, u16),
+    /// Current mouse selection.
+    selection: Option<SelectionState>,
+    /// System clipboard.
+    clipboard: Option<Clipboard>,
 }
 
 impl App {
@@ -58,6 +74,7 @@ impl App {
         let layout = GridLayout::Grid2x2;
         let grid_height = term_height.saturating_sub(STATUS_BAR_HEIGHT);
         let cell_rects = grid::compute_cells(layout, term_width, grid_height);
+        let clipboard = Clipboard::new().ok();
 
         Self {
             layout,
@@ -66,45 +83,61 @@ impl App {
             cell_rects,
             pty_manager: PtyManager::new(pty_output_tx),
             term_size: (term_width, grid_height),
+            selection: None,
+            clipboard,
         }
     }
 
-    /// Run the application event loop. This is the main entry point.
+    /// Run the application event loop.
     pub async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let size = terminal.size()?;
         let (pty_tx, mut pty_rx) = mpsc::unbounded_channel::<PtyOutput>();
 
         let mut app = App::new(size.width, size.height, pty_tx);
         app.init_cells()?;
-
-        // Initial render
         app.draw(terminal)?;
 
-        // Event stream for crossterm events
         let mut event_stream = EventStream::new();
 
         loop {
             tokio::select! {
-                // Handle crossterm events (keyboard input, resize)
                 event = event_stream.next() => {
                     match event {
                         Some(Ok(Event::Key(key_event))) => {
                             match input::handle_key_event(key_event) {
                                 InputAction::Quit => break,
                                 InputAction::CycleLayout => {
+                                    app.selection = None;
                                     app.cycle_layout()?;
                                     app.draw(terminal)?;
                                 }
                                 InputAction::MoveFocus(dir) => {
+                                    app.selection = None;
                                     app.move_focus(dir);
                                     app.draw(terminal)?;
                                 }
+                                InputAction::Copy => {
+                                    app.handle_copy()?;
+                                    app.draw(terminal)?;
+                                }
+                                InputAction::Paste => {
+                                    app.handle_paste()?;
+                                }
                                 InputAction::PtyInput(data) => {
+                                    // Any keyboard input clears selection
+                                    if app.selection.is_some() {
+                                        app.selection = None;
+                                        app.draw(terminal)?;
+                                    }
                                     let idx = grid::rc_to_index(app.layout, app.focus.0, app.focus.1);
                                     app.pty_manager.write_to(idx, &data)?;
                                 }
                                 InputAction::None => {}
                             }
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            app.handle_mouse(mouse)?;
+                            app.draw(terminal)?;
                         }
                         Some(Ok(Event::Resize(w, h))) => {
                             app.handle_resize(w, h)?;
@@ -115,7 +148,6 @@ impl App {
                         _ => {}
                     }
                 }
-                // Handle PTY output
                 Some(output) = pty_rx.recv() => {
                     if output.cell_index < app.cells.len() {
                         app.cells[output.cell_index].feed(&output.data);
@@ -135,7 +167,6 @@ impl App {
         self.pty_manager
             .ensure_count(count, |idx| cell_inner_size(rects, idx))?;
 
-        // Create terminal cell buffers
         while self.cells.len() < count {
             let (cols, rows) = cell_inner_size(&self.cell_rects, self.cells.len());
             self.cells
@@ -159,32 +190,16 @@ impl App {
 
         self.focus = match direction {
             Direction::Up => {
-                if row == 0 {
-                    (n - 1, col)
-                } else {
-                    (row - 1, col)
-                }
+                if row == 0 { (n - 1, col) } else { (row - 1, col) }
             }
             Direction::Down => {
-                if row + 1 >= n {
-                    (0, col)
-                } else {
-                    (row + 1, col)
-                }
+                if row + 1 >= n { (0, col) } else { (row + 1, col) }
             }
             Direction::Left => {
-                if col == 0 {
-                    (row, n - 1)
-                } else {
-                    (row, col - 1)
-                }
+                if col == 0 { (row, n - 1) } else { (row, col - 1) }
             }
             Direction::Right => {
-                if col + 1 >= n {
-                    (row, 0)
-                } else {
-                    (row, col + 1)
-                }
+                if col + 1 >= n { (row, 0) } else { (row, col + 1) }
             }
         };
     }
@@ -201,20 +216,17 @@ impl App {
         let (w, h) = self.term_size;
         self.cell_rects = grid::compute_cells(self.layout, w, h);
 
-        // Ensure enough PTYs exist
         let count = self.layout.cell_count();
         let rects = &self.cell_rects;
         self.pty_manager
             .ensure_count(count, |idx| cell_inner_size(rects, idx))?;
 
-        // Ensure enough cell buffers exist
         while self.cells.len() < count {
             let (cols, rows) = cell_inner_size(&self.cell_rects, self.cells.len());
             self.cells
                 .push(TerminalCell::new(cols as usize, rows as usize));
         }
 
-        // Resize existing cell buffers and PTYs
         for i in 0..count {
             let (cols, rows) = cell_inner_size(&self.cell_rects, i);
             if i < self.cells.len() {
@@ -223,12 +235,158 @@ impl App {
             let _ = self.pty_manager.resize(i, cols, rows);
         }
 
-        // Clamp focus to valid range
         let n = self.layout.size();
         self.focus.0 = self.focus.0.min(n - 1);
         self.focus.1 = self.focus.1.min(n - 1);
 
         Ok(())
+    }
+
+    /// Handle mouse events (click to focus, drag to select, right-click to paste).
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        let x = mouse.column;
+        let y = mouse.row;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Find which cell was clicked
+                if let Some((cell_idx, inner_row, inner_col)) = self.screen_to_cell(x, y) {
+                    // Change focus to clicked cell
+                    let n = self.layout.size();
+                    self.focus = (cell_idx / n, cell_idx % n);
+
+                    // Start selection
+                    self.selection = Some(SelectionState {
+                        cell_index: cell_idx,
+                        start: (inner_row, inner_col),
+                        end: (inner_row, inner_col),
+                        dragging: true,
+                    });
+                } else {
+                    self.selection = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let hit = self.screen_to_cell(x, y);
+                if let Some(sel) = &mut self.selection {
+                    if sel.dragging {
+                        if let Some((cell_idx, inner_row, inner_col)) = hit {
+                            if cell_idx == sel.cell_index {
+                                sel.end = (inner_row, inner_col);
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection {
+                    sel.dragging = false;
+                    // If start == end, it's a click not a selection
+                    if sel.start == sel.end {
+                        self.selection = None;
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click to paste
+                self.handle_paste()?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Convert screen coordinates to (cell_index, inner_row, inner_col).
+    fn screen_to_cell(&self, x: u16, y: u16) -> Option<(usize, usize, usize)> {
+        let count = self.layout.cell_count().min(self.cell_rects.len());
+        for i in 0..count {
+            let rect = self.cell_rects[i];
+            if let Some(inner) = rect.inner() {
+                if x >= inner.x
+                    && x < inner.x + inner.width
+                    && y >= inner.y
+                    && y < inner.y + inner.height
+                {
+                    let row = (y - inner.y) as usize;
+                    let col = (x - inner.x) as usize;
+                    return Some((i, row, col));
+                }
+            }
+        }
+        None
+    }
+
+    /// Handle Ctrl+C: copy selection or send interrupt.
+    fn handle_copy(&mut self) -> Result<()> {
+        if let Some(sel) = &self.selection {
+            let text = self.get_selected_text(sel.cell_index, sel.start, sel.end);
+            if let Some(clipboard) = &mut self.clipboard {
+                let _ = clipboard.set_text(&text);
+            }
+            self.selection = None;
+        } else {
+            // No selection → send Ctrl+C (interrupt) to PTY
+            let idx = grid::rc_to_index(self.layout, self.focus.0, self.focus.1);
+            self.pty_manager.write_to(idx, &[3])?;
+        }
+        Ok(())
+    }
+
+    /// Handle Ctrl+V: paste clipboard text to PTY.
+    fn handle_paste(&mut self) -> Result<()> {
+        if let Some(clipboard) = &mut self.clipboard {
+            if let Ok(text) = clipboard.get_text() {
+                if !text.is_empty() {
+                    let idx = grid::rc_to_index(self.layout, self.focus.0, self.focus.1);
+                    self.pty_manager.write_to(idx, text.as_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract selected text from a cell.
+    fn get_selected_text(&self, cell_idx: usize, start: (usize, usize), end: (usize, usize)) -> String {
+        if cell_idx >= self.cells.len() {
+            return String::new();
+        }
+
+        let visible = self.cells[cell_idx].visible_lines();
+
+        // Normalize start/end so start is before end
+        let (start, end) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let mut result = String::new();
+
+        for row in start.0..=end.0 {
+            if row >= visible.len() {
+                break;
+            }
+            let line = &visible[row];
+            let col_start = if row == start.0 { start.1 } else { 0 };
+            let col_end = if row == end.0 { end.1 + 1 } else { line.len() };
+
+            for col in col_start..col_end.min(line.len()) {
+                result.push(line[col].ch);
+            }
+
+            // Trim trailing spaces from each line
+            if row < end.0 {
+                let trimmed = result.trim_end().len();
+                result.truncate(trimmed);
+                result.push('\n');
+            }
+        }
+
+        // Trim trailing spaces from the last line
+        let trimmed = result.trim_end().len();
+        result.truncate(trimmed);
+        result
     }
 
     /// Draw the current state to the terminal.
@@ -239,20 +397,26 @@ impl App {
         let cells = &self.cells;
         let focus = self.focus;
 
+        // Build selection info for rendering
+        let selection = self.selection.as_ref().map(|sel| Selection {
+            cell_index: sel.cell_index,
+            start: sel.start,
+            end: sel.end,
+        });
+
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Main grid area (everything except status bar)
             let grid_widget = GridWidget {
                 layout,
                 cell_rects,
                 cells,
                 focus_index,
+                selection: selection.as_ref(),
             };
 
             frame.render_widget(grid_widget, area);
 
-            // Status bar at the bottom
             if area.height > 0 {
                 let status_area = Rect {
                     x: 0,
